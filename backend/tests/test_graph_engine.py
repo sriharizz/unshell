@@ -1,166 +1,85 @@
-import networkx as nx
 import pytest
-from graph.engine import (
+import networkx as nx
+from graph_engine import (
     build_graph,
-    detect_cycles,
-    calculate_degree_centrality,
-    calculate_risk_score,
-    get_risk_label,
-    get_action_required,
+    calculate_risk_vectors,
+    compute_final_score,
+    export_cytoscape,
+    RISK_CIRCULAR_OWNERSHIP,
+    RISK_HIGH_RISK_JURISDICTION,
+    RISK_OFFSHORE_SHELL,
+    RISK_AI_UNVERIFIED
 )
 
-MONZO_NODES = [
-    {"id": "monzo", "label": "Monzo Bank Limited", "type": "company", "jurisdiction": "UK", "risk_level": "UNVERIFIED", "incorporation_date": "2015-01-01", "sic_codes": ["64191"]},
-    {"id": "tom_b", "label": "Tom Blomfield", "type": "individual", "jurisdiction": "UK", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-]
-MONZO_EDGES = [
-    {"id": "e1", "source": "tom_b", "target": "monzo", "label": "owns", "ownership_pct": 25.0, "trust_score": 1.0, "evidence_snippet": "PSC register", "source_doc": "Companies House API", "source_page": None},
-]
+def get_test_data():
+    nodes = [
+        {"id": "n1", "label": "Corp A", "jurisdiction": "bvi", "trust_score": 1.0},
+        {"id": "n2", "label": "Corp B", "jurisdiction": "iran", "trust_score": 1.0},
+        {"id": "n3", "label": "Corp C", "jurisdiction": "uk", "trust_score": 0.5},
+        {"id": "n4", "label": "Safe Corp", "jurisdiction": "us", "trust_score": 1.0}
+    ]
+    edges = [
+        {"source": "n1", "target": "n2", "label": "owns", "ownership_pct": 50},
+        {"source": "n2", "target": "n3", "label": "owns", "ownership_pct": 100},
+        {"source": "n3", "target": "n1", "label": "owns", "ownership_pct": 30}, # Cycle!
+        {"source": "n4", "target": "n1", "label": "owns", "ownership_pct": 100}
+    ]
+    return nodes, edges
 
-
-def test_build_graph_basic():
-    G = build_graph(MONZO_NODES, MONZO_EDGES)
+def test_g1_build_graph():
+    nodes, edges = get_test_data()
+    G = build_graph(nodes, edges)
+    
     assert isinstance(G, nx.DiGraph)
-    assert G.number_of_nodes() == 2
-    assert G.number_of_edges() == 1
+    assert len(G.nodes) == 4
+    assert len(G.edges) == 4
+    assert G.nodes["n1"]["jurisdiction"] == "bvi"
 
-
-def test_build_graph_empty():
-    G = build_graph([], [])
-    assert G.number_of_nodes() == 0
-
-
-def test_build_graph_duplicate_edges_keeps_higher_trust():
-    edges = [
-        {"id": "e1", "source": "a", "target": "b", "ownership_pct": 50, "trust_score": 0.4, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-        {"id": "e2", "source": "a", "target": "b", "ownership_pct": 50, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-    ]
-    nodes = [
-        {"id": "a", "label": "A", "type": "company", "jurisdiction": "UK", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-        {"id": "b", "label": "B", "type": "company", "jurisdiction": "UK", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-    ]
+def test_g2_risk_vectors():
+    nodes, edges = get_test_data()
     G = build_graph(nodes, edges)
-    assert G["a"]["b"]["trust_score"] == 1.0
+    G_risk = calculate_risk_vectors(G)
+    
+    # n1: bvi (offshore) + cycle
+    assert "OFFSHORE_SHELL_ENTITY" in G_risk.nodes["n1"]["risk_vectors"]
+    assert "CIRCULAR_OWNERSHIP_DETECTED" in G_risk.nodes["n1"]["risk_vectors"]
+    assert G_risk.nodes["n1"]["base_risk"] == RISK_OFFSHORE_SHELL + RISK_CIRCULAR_OWNERSHIP
+    
+    # n2: iran (high risk) + cycle
+    assert "HIGH_RISK_JURISDICTION" in G_risk.nodes["n2"]["risk_vectors"]
+    assert G_risk.nodes["n2"]["base_risk"] == RISK_HIGH_RISK_JURISDICTION + RISK_CIRCULAR_OWNERSHIP
+    
+    # n3: uk (safe) + low trust + cycle
+    assert "AI_UNVERIFIED_CLAIM" in G_risk.nodes["n3"]["risk_vectors"]
+    assert G_risk.nodes["n3"]["base_risk"] == RISK_AI_UNVERIFIED + RISK_CIRCULAR_OWNERSHIP
+    
+    # n4: us (safe) + no cycle (it only points to cycle)
+    assert G_risk.nodes["n4"]["base_risk"] == 0.0
+    assert len(G_risk.nodes["n4"]["risk_vectors"]) == 0
 
-
-def test_detect_cycles_none():
-    G = build_graph(MONZO_NODES, MONZO_EDGES)
-    assert detect_cycles(G) == []
-
-
-def test_detect_cycles_found():
-    nodes = [
-        {"id": "a", "label": "A", "type": "company", "jurisdiction": "UK", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-        {"id": "b", "label": "B", "type": "company", "jurisdiction": "UK", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-    ]
-    edges = [
-        {"id": "e1", "source": "a", "target": "b", "ownership_pct": 50, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-        {"id": "e2", "source": "b", "target": "a", "ownership_pct": 50, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-    ]
+def test_g3_compute_score():
+    nodes, edges = get_test_data()
     G = build_graph(nodes, edges)
-    cycles = detect_cycles(G)
-    assert len(cycles) > 0
+    G_risk = calculate_risk_vectors(G)
+    
+    final_score = compute_final_score(G_risk)
+    
+    # Highest risk node is n2 (25 + 40 = 65)
+    # wait n1 is 15 + 40 = 55
+    # n3 is 20 + 40 = 60
+    assert final_score == 65.0
 
-
-def test_degree_centrality_empty():
-    G = build_graph([], [])
-    assert calculate_degree_centrality(G) == {}
-
-
-def test_clean_company_score():
-    G = build_graph(MONZO_NODES, MONZO_EDGES)
-    score, fatal, cumulative = calculate_risk_score(
-        nodes=MONZO_NODES, edges=MONZO_EDGES, graph=G,
-        incorporation_date="2015-01-01", sic_codes=["64191"],
-        address="Broadwalk House, 5 Appold Street, London",
-        pscs=[{"ownership_pct": 25.0}],
-        known_shell_addresses=[], filing_count=10,
-    )
-    assert score < 30
-    assert fatal == []
-
-
-def test_circular_loop_flag():
-    nodes = [
-        {"id": "a", "label": "A", "type": "company", "jurisdiction": "BVI", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-        {"id": "b", "label": "B", "type": "company", "jurisdiction": "BVI", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-    ]
-    edges = [
-        {"id": "e1", "source": "a", "target": "b", "ownership_pct": 100, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-        {"id": "e2", "source": "b", "target": "a", "ownership_pct": 100, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-    ]
+def test_g4_export_cytoscape():
+    nodes, edges = get_test_data()
     G = build_graph(nodes, edges)
-    score, fatal, _ = calculate_risk_score(
-        nodes=nodes, edges=edges, graph=G,
-        incorporation_date=None, sic_codes=[], address="",
-        pscs=[], known_shell_addresses=[], filing_count=0,
-    )
-    assert "CIRCULAR_LOOP" in fatal
-    assert score == 100
-
-
-def test_smurf_network_flag():
-    pscs = [
-        {"ownership_pct": 20.0}, {"ownership_pct": 18.0}, {"ownership_pct": 22.0},
-    ]
-    G = build_graph([], [])
-    score, _, cumulative = calculate_risk_score(
-        nodes=[], edges=[], graph=G,
-        incorporation_date=None, sic_codes=[], address="",
-        pscs=pscs, known_shell_addresses=[], filing_count=0,
-    )
-    assert "SMURF_NETWORK" in cumulative
-
-
-def test_score_capped_at_100():
-    nodes = [
-        {"id": "a", "label": "A", "type": "company", "jurisdiction": "BVI", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-        {"id": "b", "label": "B", "type": "company", "jurisdiction": "BVI", "risk_level": "UNVERIFIED", "incorporation_date": None, "sic_codes": []},
-    ]
-    edges = [
-        {"id": "e1", "source": "a", "target": "b", "ownership_pct": 100, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-        {"id": "e2", "source": "b", "target": "a", "ownership_pct": 100, "trust_score": 1.0, "evidence_snippet": "", "label": "owns", "source_doc": "", "source_page": None},
-    ]
-    G = build_graph(nodes, edges)
-    pscs = [{"ownership_pct": 20.0}, {"ownership_pct": 18.0}, {"ownership_pct": 22.0}]
-    score, _, _ = calculate_risk_score(
-        nodes=nodes, edges=edges, graph=G,
-        incorporation_date="1980-01-01", sic_codes=["74990"],
-        address="27 Old Gloucester Street, London",
-        pscs=pscs, known_shell_addresses=["27 old gloucester street, london"],
-        filing_count=0,
-    )
-    assert score == 100
-
-
-def test_risk_labels():
-    assert get_risk_label(10) == "LOW_RISK"
-    assert get_risk_label(29) == "LOW_RISK"
-    assert get_risk_label(30) == "MEDIUM_RISK"
-    assert get_risk_label(64) == "MEDIUM_RISK"
-    assert get_risk_label(65) == "HIGH_RISK"
-    assert get_risk_label(94) == "HIGH_RISK"
-    assert get_risk_label(95) == "CRITICAL"
-    assert get_risk_label(100) == "CRITICAL"
-
-
-def test_action_required_sanctions():
-    action = get_action_required(10, [], True)
-    assert "SAR" in action
-
-
-def test_action_required_critical():
-    action = get_action_required(100, ["CIRCULAR_LOOP"], False)
-    assert "SAR" in action
-
-
-def test_empty_graph_score():
-    G = build_graph([], [])
-    score, fatal, cumulative = calculate_risk_score(
-        nodes=[], edges=[], graph=G,
-        incorporation_date=None, sic_codes=[], address="",
-        pscs=[], known_shell_addresses=[], filing_count=0,
-    )
-    assert score == 0
-    assert fatal == []
-    assert cumulative == []
+    G_risk = calculate_risk_vectors(G)
+    
+    cyto = export_cytoscape(G_risk)
+    assert "elements" in cyto
+    # 4 nodes + 4 edges = 8 elements
+    assert len(cyto["elements"]) == 8
+    
+    # Verify strict formatting
+    n1_element = next(e for e in cyto["elements"] if e["data"].get("id") == "n1")
+    assert n1_element["data"]["jurisdiction"] == "bvi"
+    assert n1_element["data"]["riskScore"] == 55.0
